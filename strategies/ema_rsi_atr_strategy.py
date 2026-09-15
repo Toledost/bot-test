@@ -50,15 +50,22 @@ class EmaRsiAtrStrategy(BaseStrategy):
         bearish_cross = prev_diff >= 0 and curr_diff < 0
 
         ema_label = f"{self._cfg.ema_fast_period}/{self._cfg.ema_slow_period}"
+        indicators = {
+            "ema_fast": float(ema_fast.iloc[-1]),
+            "ema_slow": float(ema_slow.iloc[-1]),
+            "rsi": current_rsi,
+        }
 
         if bullish_cross and current_rsi < self._cfg.rsi_overbought:
             reason = f"Cruce alcista EMA({ema_label}) con RSI={current_rsi:.2f}"
             logger.info(reason)
-            return StrategyResult(signal=Signal.LONG, atr=current_atr, reason=reason)
+            return StrategyResult(signal=Signal.LONG, atr=current_atr, reason=reason, indicators=indicators)
 
         if bearish_cross and current_rsi > self._cfg.rsi_oversold:
             reason = f"Cruce bajista EMA({ema_label}) con RSI={current_rsi:.2f}"
             logger.info(reason)
-            return StrategyResult(signal=Signal.SHORT, atr=current_atr, reason=reason)
+            return StrategyResult(signal=Signal.SHORT, atr=current_atr, reason=reason, indicators=indicators)
 
-        return StrategyResult(signal=Signal.HOLD, atr=current_atr, reason="Sin condiciones de entrada")
+        return StrategyResult(
+            signal=Signal.HOLD, atr=current_atr, reason="Sin condiciones de entrada", indicators=indicators
+        )

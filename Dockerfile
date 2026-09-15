@@ -9,8 +9,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 # Dependencias del sistema mínimas para compilar wheels nativas (numpy/pandas)
+# y tzdata para que TZ (fijado en docker-compose.yml) tenga efecto real en
+# logs y timestamps de consola — la imagen slim no lo trae por defecto.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
+        tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

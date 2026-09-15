@@ -67,12 +67,17 @@ class ExchangeClient:
         return cast(dict[str, Any], self._call(self.exchange.load_markets))
 
     def fetch_ohlcv(
-        self, symbol: str | None = None, timeframe: str | None = None, limit: int = 200
+        self,
+        symbol: str | None = None,
+        timeframe: str | None = None,
+        limit: int = 200,
+        since: int | None = None,
     ) -> list[list[float]]:
         symbol = symbol or self._cfg.symbol
         timeframe = timeframe or self._cfg.timeframe
         return cast(
-            list[list[float]], self._call(self.exchange.fetch_ohlcv, symbol, timeframe, limit=limit)
+            list[list[float]],
+            self._call(self.exchange.fetch_ohlcv, symbol, timeframe, since=since, limit=limit),
         )
 
     def fetch_order_book(self, symbol: str | None = None, limit: int = 20) -> dict[str, Any]:

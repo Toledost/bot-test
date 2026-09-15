@@ -96,6 +96,7 @@ class CoreConfig:
     loop_interval_seconds: int
     max_retries: int
     retry_backoff_base_seconds: float
+    journal_db_path: str
 
 
 @dataclass(frozen=True)
@@ -175,6 +176,7 @@ def load_settings() -> Settings:
         loop_interval_seconds=_get_int("LOOP_INTERVAL_SECONDS", 30),
         max_retries=_get_int("MAX_RETRIES", 5),
         retry_backoff_base_seconds=_get_float("RETRY_BACKOFF_BASE_SECONDS", 2),
+        journal_db_path=_get_env("JOURNAL_DB_PATH", "/data/journal.db"),
     )
 
     logging_cfg = LoggingConfig(

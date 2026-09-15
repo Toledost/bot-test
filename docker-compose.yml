@@ -8,6 +8,8 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      - TZ=${TZ:-America/Argentina/Buenos_Aires}
     volumes:
       - ./logs:/logs
       - ./data:/data

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 import pandas as pd
@@ -17,11 +17,18 @@ class Signal(str, Enum):
 
 @dataclass(frozen=True)
 class StrategyResult:
-    """Resultado de evaluar la estrategia sobre el último cierre de vela."""
+    """Resultado de evaluar la estrategia sobre el último cierre de vela.
+
+    `indicators` guarda los valores crudos que motivaron la señal (ej. valores
+    de EMA/RSI en una estrategia de cruce), específicos de cada estrategia.
+    Se persiste junto al trade para poder analizar después qué condiciones de
+    mercado produjeron los mejores/peores resultados (ver scripts/analyze_performance.py).
+    """
 
     signal: Signal
     atr: float | None = None
     reason: str = ""
+    indicators: dict[str, float] = field(default_factory=dict)
 
 
 class BaseStrategy(ABC):

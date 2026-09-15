@@ -21,6 +21,7 @@ from risk_management.position_sizer import PositionSizer
 from risk_management.validators import validate_max_open_positions, validate_sufficient_balance
 from strategies.base_strategy import BaseStrategy, Signal
 from utils.logger import get_logger
+from utils.trade_journal import TradeJournal
 
 logger = get_logger(__name__)
 
@@ -35,6 +36,7 @@ class BotEngine:
         self._strategy = strategy
 
         self._client = ExchangeClient(settings.exchange, settings.core)
+        self._journal = TradeJournal(settings.core.journal_db_path)
         self._executor: OrderExecutor = self._build_executor()
         self._sizer = PositionSizer(settings.risk)
 
@@ -46,10 +48,12 @@ class BotEngine:
     def _build_executor(self) -> OrderExecutor:
         if self._settings.execution_mode is ExecutionMode.LIVE:
             logger.warning("Inicializando en modo LIVE: las órdenes se enviarán con fondos reales.")
-            return LiveOrderExecutor(self._client)
+            return LiveOrderExecutor(self._client, self._journal, self._strategy.name)
 
         logger.info("Inicializando en modo PAPER (Dry-Run): sin envío de órdenes reales.")
-        return PaperOrderExecutor(self._settings.paper, self._settings.logging.log_dir)
+        return PaperOrderExecutor(
+            self._settings.paper, self._settings.core, self._settings.logging.log_dir, self._strategy.name
+        )
 
     def start(self) -> None:
         """Prepara el exchange (mercados, apalancamiento) antes de iniciar el ciclo."""
@@ -96,11 +100,26 @@ class BotEngine:
                 time.sleep(self._settings.core.loop_interval_seconds)
 
     def run_cycle(self) -> None:
-        """Ejecuta una iteración completa: datos -> señal -> riesgo -> ejecución."""
+        """Ejecuta una iteración completa: cierre -> datos -> señal -> riesgo -> ejecución."""
         balance = self._executor.get_balance()
         self._circuit_breaker.register_balance(balance)
 
         symbol = self._settings.exchange.symbol
+        ticker = self._client.fetch_ticker(symbol)
+        current_price = float(ticker["last"])
+
+        closed = self._executor.poll_closed_trade(symbol, current_price_hint=current_price)
+        if closed is not None:
+            logger.info(
+                "Trade cerrado en %s: motivo=%s exit=%.4f pnl=%.4f",
+                closed.symbol,
+                closed.close_reason,
+                closed.exit_price,
+                closed.pnl,
+            )
+            balance = self._executor.get_balance()
+            self._circuit_breaker.register_balance(balance)
+
         ohlcv_raw = self._client.fetch_ohlcv(symbol, self._settings.exchange.timeframe)
         ohlcv = pd.DataFrame(ohlcv_raw, columns=_OHLCV_COLUMNS)
 
@@ -119,9 +138,6 @@ class BotEngine:
         if not validate_max_open_positions(len(open_positions), self._settings.risk):
             return
 
-        ticker = self._client.fetch_ticker(symbol)
-        entry_price_hint = float(ticker["last"])
-
         if result.atr is None:
             logger.warning(
                 "La estrategia no produjo ATR; se omite la entrada por falta de dato de volatilidad."
@@ -130,21 +146,23 @@ class BotEngine:
 
         sizing = self._sizer.calculate(
             balance=balance,
-            entry_price=entry_price_hint,
+            entry_price=current_price,
             atr=result.atr,
             atr_sl_multiplier=self._settings.strategy.atr_sl_multiplier,
             atr_tp_multiplier=self._settings.strategy.atr_tp_multiplier,
             is_long=result.signal is Signal.LONG,
         )
 
-        required_margin = (sizing.amount * entry_price_hint) / max(self._settings.exchange.leverage, 1)
+        required_margin = (sizing.amount * current_price) / max(self._settings.exchange.leverage, 1)
         validate_sufficient_balance(balance, required_margin)
 
         self._executor.open_position(
             symbol=symbol,
             signal=result.signal,
             amount=sizing.amount,
-            entry_price_hint=entry_price_hint,
+            entry_price_hint=current_price,
             stop_loss_price=sizing.stop_loss_price,
             take_profit_price=sizing.take_profit_price,
+            signal_reason=result.reason,
+            indicators=result.indicators,
         )

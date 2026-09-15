@@ -16,18 +16,18 @@ class DailyLossCircuitBreaker:
     que el bot vuelve a operar en el siguiente día natural sin intervención manual.
     """
 
-    def __init__(self, cfg: RiskConfig, starting_balance: float) -> None:
+    def __init__(self, cfg: RiskConfig, starting_balance: float, as_of_date: date | None = None) -> None:
         self._cfg = cfg
         self._day_start_balance = starting_balance
-        self._current_day = self._utc_today()
+        self._current_day = as_of_date if as_of_date is not None else self._utc_today()
         self._tripped = False
 
     @staticmethod
     def _utc_today() -> date:
         return datetime.now(UTC).date()
 
-    def _maybe_reset_for_new_day(self, current_balance: float) -> None:
-        today = self._utc_today()
+    def _maybe_reset_for_new_day(self, current_balance: float, as_of_date: date | None) -> None:
+        today = as_of_date if as_of_date is not None else self._utc_today()
         if today != self._current_day:
             logger.info(
                 "Nuevo día UTC detectado (%s -> %s). Reseteando circuit breaker de pérdida diaria.",
@@ -38,9 +38,16 @@ class DailyLossCircuitBreaker:
             self._day_start_balance = current_balance
             self._tripped = False
 
-    def register_balance(self, current_balance: float) -> None:
-        """Actualiza el estado del breaker con el balance actual. Llamar en cada ciclo."""
-        self._maybe_reset_for_new_day(current_balance)
+    def register_balance(self, current_balance: float, as_of_date: date | None = None) -> None:
+        """Actualiza el estado del breaker con el balance actual. Llamar en cada ciclo.
+
+        `as_of_date` permite inyectar la fecha "actual" en vez de leer el reloj
+        real del sistema — necesario en scripts/backtest.py, donde las velas
+        simuladas avanzan por el calendario histórico mucho más rápido (o más
+        lento) que el reloj real del proceso. En producción (paper/live) se
+        omite y se usa datetime.now(UTC) como siempre.
+        """
+        self._maybe_reset_for_new_day(current_balance, as_of_date)
 
         if self._day_start_balance <= 0:
             return
