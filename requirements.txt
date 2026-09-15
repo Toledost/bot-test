@@ -1,0 +1,10 @@
+ccxt==4.4.32
+python-dotenv==1.0.1
+pandas==2.2.3
+numpy==2.1.3
+tenacity==9.0.0
+
+# --- Desarrollo / Testing (no requerido en la imagen de producción) ---
+pytest==8.3.3
+ruff==0.7.4
+mypy==1.13.0
