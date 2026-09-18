@@ -74,6 +74,9 @@ class StrategyConfig:
     atr_period: int
     atr_sl_multiplier: float
     atr_tp_multiplier: float
+    trend_filter_ema_period: int
+    min_volatility_ratio: float
+    volatility_sma_period: int
 
 
 @dataclass(frozen=True)
@@ -157,6 +160,9 @@ def load_settings() -> Settings:
         atr_period=_get_int("ATR_PERIOD", 14),
         atr_sl_multiplier=_get_float("ATR_SL_MULTIPLIER", 1.5),
         atr_tp_multiplier=_get_float("ATR_TP_MULTIPLIER", 3.0),
+        trend_filter_ema_period=_get_int("TREND_FILTER_EMA_PERIOD", 0),
+        min_volatility_ratio=_get_float("MIN_VOLATILITY_RATIO", 0),
+        volatility_sma_period=_get_int("VOLATILITY_SMA_PERIOD", 20),
     )
 
     risk = RiskConfig(

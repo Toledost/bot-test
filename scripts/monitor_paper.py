@@ -90,7 +90,7 @@ def _fmt_local_time(iso_timestamp: str | None) -> str:
     dt = datetime.fromisoformat(iso_timestamp)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
-    return dt.astimezone(_DISPLAY_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    return dt.astimezone(_DISPLAY_TZ).strftime("%m-%d %H:%M:%S")
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -167,7 +167,7 @@ def _print_snapshot(conn: sqlite3.Connection, last_n: int, initial_balance: floa
 
     print(f"\nÚltimos {last_n} trades:\n")
     rows = conn.execute(
-        "SELECT id, opened_at, closed_at, symbol, side, amount, entry_price, exit_price, pnl, status "
+        "SELECT id, opened_at, closed_at, side, amount, entry_price, exit_price, pnl, status "
         "FROM trades ORDER BY id DESC LIMIT ?",
         (last_n,),
     ).fetchall()
@@ -177,20 +177,32 @@ def _print_snapshot(conn: sqlite3.Connection, last_n: int, initial_balance: floa
         return
 
     header = (
-        f"  {'ID':>4}  {'Estado':<7} {'Lado':<5} {'Símbolo':<16} "
-        f"{'Entrada':>10} {'Salida':>10} {'PnL':>10} {'PnL %':>9}  Abierto ({tz_label})"
+        f"  {'ID':>4}  {'Estado':<7} {'Lado':<5} "
+        f"{'Entrada':>10} {'Salida':>10} {'PnL':>10} {'PnL %':>9}  {'Duración':>10}  Abierto ({tz_label})"
     )
     print(header)
     print("  " + "-" * (len(header) - 2))
+    now_utc = datetime.now(UTC)
     for row in rows:
         exit_price = f"{row['exit_price']:.2f}" if row["exit_price"] is not None else "-"
         pnl = _fmt_money(row["pnl"]) if row["pnl"] is not None else "-"
         notional = row["entry_price"] * row["amount"]
         pnl_pct = (row["pnl"] / notional * 100) if row["pnl"] is not None and notional else None
         opened_at = _fmt_local_time(row["opened_at"])
+        opened_dt = datetime.fromisoformat(row["opened_at"])
+        if opened_dt.tzinfo is None:
+            opened_dt = opened_dt.replace(tzinfo=UTC)
+        if row["closed_at"]:
+            closed_dt = datetime.fromisoformat(row["closed_at"])
+            if closed_dt.tzinfo is None:
+                closed_dt = closed_dt.replace(tzinfo=UTC)
+            duration = _fmt_duration((closed_dt - opened_dt).total_seconds())
+        else:
+            duration = _fmt_duration((now_utc - opened_dt).total_seconds())
         print(
-            f"  {row['id']:>4}  {row['status']:<7} {_side_label(row['side']):<5} {row['symbol']:<16} "
-            f"{row['entry_price']:>10.2f} {exit_price:>10} {pnl:>10} {_fmt_pct(pnl_pct):>9}  {opened_at}"
+            f"  {row['id']:>4}  {row['status']:<7} {_side_label(row['side']):<5} "
+            f"{row['entry_price']:>10.2f} {exit_price:>10} {pnl:>10} {_fmt_pct(pnl_pct):>9}  "
+            f"{duration:>10}  {opened_at}"
         )
     print()
 
