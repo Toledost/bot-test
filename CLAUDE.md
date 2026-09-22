@@ -106,22 +106,33 @@ risk_management/     position_sizer.py calcula el tamaño de posición para que 
                      de pérdida diaria configurado, resetea en el siguiente día UTC).
                      validators.py valida saldo suficiente y límite de posiciones abiertas.
 
-execution/            OrderExecutor (interfaz ABC) con dos implementaciones. Ambas, en
-                     cada ciclo, primero llaman poll_closed_trade() para detectar si
-                     la posición gestionada ya se cerró (por SL o TP) antes de evaluar
-                     nuevas señales — sin esto no hay forma de saber si un trade ganó
-                     o perdió, así que es el mecanismo que hace posible el journal.
-                     - LiveOrderExecutor: envía órdenes reales, coloca SL/TP server-side
-                       (STOP_MARKET / TAKE_PROFIT_MARKET) inmediatamente tras la entrada.
+execution/            OrderExecutor (interfaz ABC) con dos implementaciones. No hay Take
+                     Profit fijo: la salida es exclusivamente por Stop Loss, que arranca
+                     en el nivel de ATR_SL_MULTIPLIER y desde ahí solo se desplaza a favor
+                     del trader vía update_trailing_stop (canal Donchian de
+                     TRAILING_STOP_CHANNEL_PERIOD velas, nunca retrocede), dejando correr
+                     la ganancia en tendencias sostenidas en vez de cortarla en un TP fijo
+                     (ver "Trailing stop (canal Donchian)" más abajo). Ambas implementaciones,
+                     en cada ciclo, primero llaman poll_closed_trade() para detectar si la
+                     posición gestionada ya se cerró (por SL) antes de evaluar nuevas
+                     señales — sin esto no hay forma de saber si un trade ganó o perdió,
+                     así que es el mecanismo que hace posible el journal.
+                     - LiveOrderExecutor: envía órdenes reales, coloca el SL server-side
+                       (STOP_MARKET) inmediatamente tras la entrada. update_trailing_stop()
+                       coloca la nueva orden STOP_MARKET antes de cancelar la vieja, para
+                       nunca dejar la posición sin protección server-side ni un instante.
                        poll_closed_trade() confirma el cierre vía fetch_positions (no solo
-                       mirando si las órdenes SL/TP siguen abiertas, que puede quedar
-                       temporalmente desincronizado) y cancela la orden de protección
-                       huérfana que haya quedado.
+                       mirando si la orden SL sigue abierta, que puede quedar temporalmente
+                       desincronizada) y cancela la orden de protección huérfana que haya
+                       quedado.
                      - PaperOrderExecutor: simula fills con slippage conservador y fee
                        taker, persiste balance/trades operativos en SQLite (paper_store.py,
                        data/trades_paper.db) y en logs/trades_paper.log. poll_closed_trade()
-                       simula el cierre comparando el último precio de ticker contra el
-                       SL/TP guardado.
+                       simula el cierre comparando el último precio de ticker contra el SL
+                       guardado. PaperStore mantiene una única conexión SQLite persistente
+                       (WAL + synchronous=NORMAL) en vez de abrir/cerrar una por llamada:
+                       con el trailing, una posición puede quedar abierta durante cientos
+                       de velas, y el fsync por commit degradaba severamente backtests largos.
 
 utils/               logger.py configura logging a consola + archivo rotativo
                      (RotatingFileHandler) sobre el volumen /logs montado en Docker.
@@ -133,7 +144,7 @@ utils/               logger.py configura logging a consola + archivo rotativo
 
 tests/               Tests unitarios de pytest. Prioridad: position_sizer,
                      circuit_breaker (seguridad de capital) y paper_executor
-                     (detección de cierre SL/TP y registro en el journal).
+                     (detección de cierre por SL/trailing y registro en el journal).
 
 scripts/             Utilidades operativas fuera del ciclo de vida del bot.
                      - monitor_paper.py: lee data/trades_paper.db (SQLite) en modo
@@ -175,13 +186,16 @@ main.py              Punto de entrada. Carga settings, configura logging, instan
 Estas reglas son invariantes de seguridad de capital. Cualquier refactor, nueva
 estrategia o nuevo executor debe preservarlas sin excepción:
 
-1. **SL/TP server-side obligatorios en modo live.** Toda apertura de posición en
-   `LiveOrderExecutor` DEBE colocar inmediatamente órdenes `STOP_MARKET` y
-   `TAKE_PROFIT_MARKET` registradas en BingX tras la orden de entrada. Si la
-   colocación de cualquiera de las dos falla, la posición se cierra de inmediato
-   (`ProtectiveOrderFailure`) — nunca debe quedar una posición abierta sin protección
-   server-side, porque si el host local se apaga o pierde conectividad, el exchange
-   sigue protegiendo la cuenta de forma autónoma.
+1. **Stop Loss server-side obligatorio en modo live.** Toda apertura de posición en
+   `LiveOrderExecutor` DEBE colocar inmediatamente una orden `STOP_MARKET` registrada
+   en BingX tras la orden de entrada. Si la colocación falla, la posición se cierra
+   de inmediato (`ProtectiveOrderFailure`) — nunca debe quedar una posición abierta
+   sin protección server-side, porque si el host local se apaga o pierde
+   conectividad, el exchange sigue protegiendo la cuenta de forma autónoma. No hay
+   Take Profit fijo (ver "Trailing stop" más abajo): cuando `update_trailing_stop`
+   desplaza el SL, la nueva orden `STOP_MARKET` se coloca ANTES de cancelar la
+   vieja, para no dejar la posición desprotegida ni un instante durante el
+   reemplazo.
 
 2. **Dimensionamiento por riesgo fijo, nunca por tamaño fijo.** El tamaño de una
    posición siempre se deriva de `RISK_PER_TRADE_PCT` y la distancia al Stop Loss
@@ -191,7 +205,7 @@ estrategia o nuevo executor debe preservarlas sin excepción:
 3. **Circuit breaker de pérdida diaria es de solo bloqueo, nunca de auto-cierre de
    posiciones abiertas.** Al superar `DAILY_LOSS_LIMIT_PCT`, el bot congela nuevas
    aperturas (`can_open_position() -> False`) pero NO cierra posiciones existentes
-   (esas ya están protegidas por su propio SL/TP server-side). El breaker resetea
+   (esas ya están protegidas por su propio SL server-side). El breaker resetea
    automáticamente al cruzar medianoche UTC, nunca manualmente ni por reinicio del
    proceso.
 
@@ -231,16 +245,19 @@ estrategia o nuevo executor debe preservarlas sin excepción:
 - **Qué se registra:** cada trade (paper y live) guarda en `data/journal.db` el
   contexto de la decisión de entrada (`signal_reason`, `indicators` — ej. valores
   de EMA/RSI en el momento de la señal, serializados en `indicators_json`) y, al
-  cerrarse, el resultado (`exit_price`, `pnl`, `close_reason`: `stop_loss` /
-  `take_profit` / `manual`).
+  cerrarse, el resultado (`exit_price`, `pnl`, `close_reason`). Sin Take Profit
+  fijo, `close_reason` es siempre `stop_loss` (el SL inicial o el desplazado por
+  el trailing) o `manual`; `take_profit_price` se sigue guardando a título
+  informativo (nivel que hubiese tenido un TP fijo con `ATR_TP_MULTIPLIER`) pero
+  nunca determina un cierre.
 - **Detección de cierre:** el bot no recibe un webhook de BingX cuando se ejecuta
-  un SL/TP — lo detecta activamente en cada ciclo (`OrderExecutor.poll_closed_trade`,
+  el SL — lo detecta activamente en cada ciclo (`OrderExecutor.poll_closed_trade`,
   llamado al inicio de `BotEngine.run_cycle` antes de buscar nuevas señales). En
-  paper se simula comparando el precio actual contra los niveles guardados; en
-  live se confirma consultando `fetch_positions`.
+  paper se simula comparando el precio actual contra el SL guardado; en live se
+  confirma consultando `fetch_positions`.
 - **Limitación conocida:** si el proceso se reinicia mientras hay una posición
   gestionada por el bot abierta, el estado en memoria de `LiveOrderExecutor`
-  (`_managed_protective_orders`, IDs de las órdenes SL/TP) se pierde, así que ese
+  (`_managed_protective_orders`, ID de la orden SL) se pierde, así que ese
   trade específico podría no cerrarse en el journal aunque BingX sí lo cierre
   correctamente (la protección server-side no depende de este estado, solo el
   registro de aprendizaje). No se implementó recuperación automática de este
@@ -249,9 +266,52 @@ estrategia o nuevo executor debe preservarlas sin excepción:
 - **Analizar resultados:** `python scripts/analyze_performance.py` segmenta los
   trades cerrados por lado, motivo de cierre, rango de RSI en la entrada y
   distancia al SL (proxy de volatilidad). Usar esto para decidir manualmente si
-  ajustar `RSI_OVERBOUGHT`/`RSI_OVERSOLD`, `ATR_SL_MULTIPLIER`/`ATR_TP_MULTIPLIER`,
+  ajustar `RSI_OVERBOUGHT`/`RSI_OVERSOLD`, `ATR_SL_MULTIPLIER`, `TRAILING_STOP_CHANNEL_PERIOD`,
   etc. en `.env` — **no** hay ajuste automático; con pocos trades por segmento
   (n < ~30) las diferencias pueden ser ruido, no señal real.
+
+## Trailing stop (canal Donchian)
+
+Reemplaza el Take Profit fijo que tenía la estrategia original. Validado con
+walk-forward (4 tramos trimestrales sobre 365 días de BTC/USDT:USDT 1h): un
+Take Profit fijo cortaba las tendencias largas antes de que se desarrollaran,
+y el edge real de la estrategia depende de dejarlas correr (pocas ganancias
+grandes compensan muchas pérdidas chicas — con `TRAILING_STOP_CHANNEL_PERIOD=55`
+el backtest de producción de 365 días dio 128 trades, win rate 16.4%, PnL total
+positivo, **100% de los cierres por `stop_loss`** porque no hay otro mecanismo
+de salida).
+
+- **Mecánica:** en cada ciclo, antes de evaluar nuevas señales,
+  `OrderExecutor.update_trailing_stop(symbol, ohlcv, channel_period)` calcula el
+  canal Donchian de las últimas `TRAILING_STOP_CHANNEL_PERIOD` velas cerradas
+  (excluyendo la vela del ciclo actual) y mueve el SL de la posición gestionada
+  al mínimo (LONG) o máximo (SHORT) de ese canal — **solo si mejora el SL
+  vigente a favor del trader, nunca lo retrocede**. El SL inicial al abrir la
+  posición sigue siendo `entry_price ± (ATR * ATR_SL_MULTIPLIER)`, calculado por
+  `PositionSizer` igual que antes.
+- **Nunca desprotegido en live:** `LiveOrderExecutor.update_trailing_stop`
+  coloca la nueva orden `STOP_MARKET` ANTES de cancelar la vieja (ver regla 1
+  de gestión de riesgo). Si la colocación del nuevo SL falla, se registra un
+  warning y el SL vigente sigue protegiendo la posición sin interrumpir el
+  ciclo — a diferencia de un fallo en `open_position`, no es crítico porque ya
+  existe protección server-side activa.
+- **`ATR_TP_MULTIPLIER` se conserva** en `StrategyConfig`/`PositionSizer` por
+  compatibilidad de sizing (el cálculo de `amount` depende solo del SL, nunca
+  del TP) y el valor resultante se persiste en el journal a título informativo,
+  pero ningún executor lo usa para cerrar una posición.
+- **Rendimiento en backtest:** con el trailing, una posición puede permanecer
+  abierta durante cientos de velas (mucho más que con TP fijo), así que
+  `update_trailing_stop`/`poll_closed_trade`/`get_open_positions` consultan
+  SQLite en casi todos los ciclos del backtest. `PaperStore` mantiene una
+  conexión persistente en modo WAL con `synchronous=NORMAL` (en vez de
+  abrir/cerrar conexión con fsync completo por llamada) para que esto no
+  degrade backtests largos — ver "Rendimiento de scripts/backtest.py" abajo.
+- **Explorar otro canal:** antes de cambiar `TRAILING_STOP_CHANNEL_PERIOD` en
+  `.env`, correr un walk-forward (varios tramos independientes, no una sola
+  ventana) — un canal más ancho o más angosto puede rendir muy distinto según
+  el tramo de mercado usado para "descubrirlo" (el análisis original encontró
+  que canales angostos como 30 solo ganaban gracias a haber capturado un único
+  movimiento extremo, no por un edge sistemático).
 
 ## Backtesting (scripts/backtest.py)
 
@@ -291,11 +351,9 @@ reimplementación aparte.
 - **Simplificación conocida:** la señal se evalúa con las velas hasta la vela
   actual (inclusive) y la entrada se ejecuta al cierre de esa misma vela —
   estándar en backtesting de velas cerradas, pero no idéntica a producción
-  (que actúa un ciclo después de que la vela cierra). El SL/TP sí se valida
+  (que actúa un ciclo después de que la vela cierra). El SL sí se valida
   contra el high/low real de cada vela posterior (no solo el cierre), evitando
-  el sesgo más grave de subestimar cuántas veces se tocó el SL/TP intravela. Si
-  una vela toca tanto el SL como el TP, se asume conservadoramente que el SL
-  ocurrió primero (sin datos tick a tick no hay forma de saber el orden real).
+  el sesgo más grave de subestimar cuántas veces se tocó el SL intravela.
 
 ## Convenciones de estilo
 
@@ -374,7 +432,8 @@ reimplementación aparte.
 5. Empezar con capital real reducido (una fracción pequeña del capital objetivo)
    durante el primer período en `live`, monitoreando activamente `docker compose logs -f`.
 6. Reconstruir y levantar: `docker compose up -d --build`.
-7. Confirmar en los primeros ciclos, revisando logs, que las órdenes `STOP_MARKET` y
-   `TAKE_PROFIT_MARKET` efectivamente aparecen como órdenes abiertas en la cuenta de
-   BingX (verificar manualmente en el exchange, no solo confiar en el log local) tras
-   cada apertura de posición.
+7. Confirmar en los primeros ciclos, revisando logs, que la orden `STOP_MARKET`
+   efectivamente aparece como orden abierta en la cuenta de BingX (verificar
+   manualmente en el exchange, no solo confiar en el log local) tras cada
+   apertura de posición, y que se reemplaza correctamente (nueva orden antes
+   de cancelar la vieja) cuando el trailing la desplaza.

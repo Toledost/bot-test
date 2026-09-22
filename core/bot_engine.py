@@ -123,6 +123,10 @@ class BotEngine:
         ohlcv_raw = self._client.fetch_ohlcv(symbol, self._settings.exchange.timeframe)
         ohlcv = pd.DataFrame(ohlcv_raw, columns=_OHLCV_COLUMNS)
 
+        self._executor.update_trailing_stop(
+            symbol, ohlcv, self._settings.strategy.trailing_stop_channel_period
+        )
+
         result = self._strategy.evaluate(ohlcv)
 
         if result.signal in (Signal.HOLD, Signal.CLOSE):

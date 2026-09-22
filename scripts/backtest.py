@@ -156,6 +156,8 @@ def run_backtest(days: int, timeframe: str | None, reset: bool) -> None:
         if result is not None:
             closed += 1
 
+        executor.update_trailing_stop(symbol, window, settings.strategy.trailing_stop_channel_period)
+
         strategy_result = strategy.evaluate(window)
         if strategy_result.signal in (Signal.HOLD, Signal.CLOSE):
             continue

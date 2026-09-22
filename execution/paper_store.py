@@ -31,22 +31,34 @@ CREATE TABLE IF NOT EXISTS trades (
 
 
 class PaperStore:
-    """Acceso a la base de datos SQLite que respalda el paper trading."""
+    """Acceso a la base de datos SQLite que respalda el paper trading.
+
+    Mantiene una única conexión persistente durante la vida del proceso en
+    vez de abrir/cerrar una por llamada: con el trailing stop, una posición
+    puede quedar abierta durante cientos de velas (ver update_trailing_stop
+    en PaperOrderExecutor), y abrir conexión SQLite en cada ciclo para
+    consultarla degradaba severamente el rendimiento de backtests largos.
+    """
 
     def __init__(self, db_path: str, initial_balance: float) -> None:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db_path = db_path
+        self._conn = sqlite3.connect(db_path)
+        self._conn.row_factory = sqlite3.Row
+        # WAL + synchronous=NORMAL: evita el fsync completo en cada commit (el
+        # cuello de botella real con el trailing stop, que consulta/actualiza
+        # el trade abierto en casi todas las velas). Es simulación de paper
+        # trading, no dinero real: perder el último commit ante un crash del
+        # proceso es aceptable a cambio de que un backtest de 365 días no
+        # tarde horas.
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
         self._init_schema(initial_balance)
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self._db_path)
-        try:
-            conn.row_factory = sqlite3.Row
-            yield conn
-            conn.commit()
-        finally:
-            conn.close()
+        yield self._conn
+        self._conn.commit()
 
     def _init_schema(self, initial_balance: float) -> None:
         with self._connect() as conn:
@@ -100,6 +112,12 @@ class PaperStore:
                 WHERE id = ?
                 """,
                 (closed_at, exit_price, pnl, extra_fee, trade_id),
+            )
+
+    def update_stop_loss(self, trade_id: int, new_stop_loss_price: float) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE trades SET stop_loss_price = ? WHERE id = ?", (new_stop_loss_price, trade_id)
             )
 
     def get_open_trades(self, symbol: str | None = None) -> list[sqlite3.Row]:

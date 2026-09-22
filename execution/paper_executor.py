@@ -9,6 +9,8 @@ import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pandas as pd
+
 from config.settings import CoreConfig, PaperConfig
 from execution.order_executor import ClosedTrade, ExecutedTrade, OrderExecutor
 from execution.paper_store import PaperStore
@@ -34,7 +36,15 @@ def _setup_paper_trade_logger(log_dir: str) -> None:
 
 
 class PaperOrderExecutor(OrderExecutor):
-    """Simula la ejecución de órdenes aplicando comisión taker y slippage conservador."""
+    """Simula la ejecución de órdenes aplicando comisión taker y slippage conservador.
+
+    La salida de una posición es exclusivamente por Stop Loss: no hay Take
+    Profit fijo. El SL arranca en el nivel calculado por PositionSizer (según
+    ATR_SL_MULTIPLIER) y desde ahí solo se desplaza a favor del trader vía
+    update_trailing_stop (canal Donchian de TRAILING_STOP_CHANNEL_PERIOD
+    velas), dejando correr la ganancia en tendencias sostenidas en vez de
+    cortarla en un TP fijo (ver docstring de update_trailing_stop).
+    """
 
     def __init__(
         self,
@@ -205,15 +215,16 @@ class PaperOrderExecutor(OrderExecutor):
         low_hint: float | None = None,
         timestamp_hint: datetime | None = None,
     ) -> ClosedTrade | None:
-        """Simula el cierre comparando el precio contra el SL/TP guardado.
+        """Simula el cierre comparando el precio contra el Stop Loss guardado.
 
-        En paper trading en vivo, sin high_hint/low_hint, aproxima el cruce
-        usando solo el último precio de ticker del ciclo (simplificación
-        razonable para timeframes >= 1m). En backtest, high_hint/low_hint
-        (el rango de la vela histórica) permiten detectar un cruce intravela
-        que el precio de cierre solo no vería. Si la vela tocó tanto el SL
-        como el TP, se asume conservadoramente que el SL ocurrió primero
-        (peor caso: sin datos tick a tick no hay forma de saber el orden real).
+        La salida es exclusivamente por Stop Loss (fijo o desplazado por
+        update_trailing_stop): no hay Take Profit fijo, la posición se deja
+        correr hasta que el trailing la cierre (ver docstring de la clase y
+        update_trailing_stop). En paper trading en vivo, sin high_hint/
+        low_hint, aproxima el cruce usando solo el último precio de ticker
+        del ciclo (simplificación razonable para timeframes >= 1m). En
+        backtest, high_hint/low_hint (el rango de la vela histórica) permiten
+        detectar un cruce intravela que el precio de cierre solo no vería.
         """
         if current_price_hint is None:
             return None
@@ -225,7 +236,6 @@ class PaperOrderExecutor(OrderExecutor):
         trade = open_trades[0]
         side = str(trade["side"])
         stop_loss_price = float(trade["stop_loss_price"])
-        take_profit_price = float(trade["take_profit_price"])
         amount = float(trade["amount"])
         is_long = side == "buy"
 
@@ -233,13 +243,11 @@ class PaperOrderExecutor(OrderExecutor):
         check_low = low_hint if low_hint is not None else current_price_hint
 
         hit_sl = check_low <= stop_loss_price if is_long else check_high >= stop_loss_price
-        hit_tp = check_high >= take_profit_price if is_long else check_low <= take_profit_price
-
-        if not hit_sl and not hit_tp:
+        if not hit_sl:
             return None
 
-        close_reason = "stop_loss" if hit_sl else "take_profit"  # SL tiene prioridad en caso de ambigüedad
-        exit_price_hint = stop_loss_price if hit_sl else take_profit_price
+        close_reason = "stop_loss"
+        exit_price_hint = stop_loss_price
 
         balance_before = self._store.get_balance()
         self.close_position(
@@ -258,6 +266,45 @@ class PaperOrderExecutor(OrderExecutor):
             pnl=balance_after - balance_before,
             close_reason=close_reason,
         )
+
+    def update_trailing_stop(
+        self,
+        symbol: str,
+        ohlcv: pd.DataFrame,
+        channel_period: int,
+    ) -> None:
+        open_trades = self._store.get_open_trades(symbol)
+        if not open_trades:
+            return
+
+        trade = open_trades[0]
+        is_long = str(trade["side"]) == "buy"
+        current_sl = float(trade["stop_loss_price"])
+
+        # Canal de las últimas `channel_period` velas cerradas, excluyendo la
+        # última fila (la vela del ciclo actual, que puede seguir en formación
+        # en producción). En LONG el SL solo sube (nunca retrocede a favor del
+        # mercado); en SHORT solo baja.
+        channel = ohlcv.iloc[-(channel_period + 1) : -1]
+        if channel.empty:
+            return
+
+        if is_long:
+            candidate_sl = float(channel["low"].min())
+            new_sl = max(candidate_sl, current_sl)
+        else:
+            candidate_sl = float(channel["high"].max())
+            new_sl = min(candidate_sl, current_sl)
+
+        if new_sl != current_sl:
+            self._store.update_stop_loss(trade["id"], new_sl)
+            logger.info(
+                "[%s] TRAILING %s SL %.4f -> %.4f",
+                self._execution_mode.upper(),
+                symbol,
+                current_sl,
+                new_sl,
+            )
 
     def get_balance(self) -> float:
         return self._store.get_balance()

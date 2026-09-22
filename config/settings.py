@@ -77,6 +77,7 @@ class StrategyConfig:
     trend_filter_ema_period: int
     min_volatility_ratio: float
     volatility_sma_period: int
+    trailing_stop_channel_period: int
 
 
 @dataclass(frozen=True)
@@ -163,6 +164,7 @@ def load_settings() -> Settings:
         trend_filter_ema_period=_get_int("TREND_FILTER_EMA_PERIOD", 0),
         min_volatility_ratio=_get_float("MIN_VOLATILITY_RATIO", 0),
         volatility_sma_period=_get_int("VOLATILITY_SMA_PERIOD", 20),
+        trailing_stop_channel_period=_get_int("TRAILING_STOP_CHANNEL_PERIOD", 55),
     )
 
     risk = RiskConfig(

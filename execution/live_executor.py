@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pandas as pd
+
 from core.exceptions import ProtectiveOrderFailure
 from core.exchange_client import ExchangeClient
 from execution.order_executor import ClosedTrade, ExecutedTrade, OrderExecutor
@@ -14,21 +16,25 @@ logger = get_logger(__name__)
 
 
 class LiveOrderExecutor(OrderExecutor):
-    """Envía órdenes reales al exchange. Coloca SL/TP inmediatamente tras la entrada.
+    """Envía órdenes reales al exchange. Coloca el SL inmediatamente tras la entrada.
+
+    No hay Take Profit fijo: la salida es exclusivamente por Stop Loss, que
+    solo se desplaza a favor del trader vía update_trailing_stop (canal
+    Donchian), dejando correr la ganancia en vez de cortarla en un TP fijo.
 
     Regla crítica de seguridad: si la orden de mercado se ejecuta pero la
-    colocación de SL o TP falla, la posición queda temporalmente desprotegida.
-    En ese caso se reintenta una vez y, si vuelve a fallar, se cierra la
-    posición de inmediato para no dejar exposición sin protección server-side.
+    colocación del SL falla, la posición queda temporalmente desprotegida.
+    En ese caso se cierra la posición de inmediato para no dejar exposición
+    sin protección server-side.
     """
 
     def __init__(self, client: ExchangeClient, journal: TradeJournal, strategy_name: str) -> None:
         self._client = client
         self._journal = journal
         self._strategy_name = strategy_name
-        # Órdenes de protección de la posición actualmente gestionada por el bot
-        # en cada símbolo. Necesario para poll_closed_trade: cuando estos IDs ya
-        # no aparecen entre las órdenes abiertas, la posición se cerró (por SL o TP).
+        # Orden de protección (SL) de la posición actualmente gestionada por el
+        # bot en cada símbolo. Necesario para poll_closed_trade: cuando este ID
+        # ya no aparece entre las órdenes abiertas, la posición se cerró.
         self._managed_protective_orders: dict[str, tuple[str | None, str | None]] = {}
         self._journal_entry_ids: dict[str, int] = {}
 
@@ -46,7 +52,9 @@ class LiveOrderExecutor(OrderExecutor):
         timestamp_hint: datetime | None = None,
     ) -> ExecutedTrade:
         # timestamp_hint es exclusivo de scripts/backtest.py: en live el reloj
-        # real siempre es correcto, se ignora si llegara a pasarse.
+        # real siempre es correcto, se ignora si llegara a pasarse. take_profit_price
+        # se recibe por compatibilidad con la interfaz y se persiste a título
+        # informativo en el journal, pero no se coloca orden ni se usa para cerrar.
         entry_side = "buy" if signal is Signal.LONG else "sell"
         exit_side = "sell" if signal is Signal.LONG else "buy"
 
@@ -55,20 +63,14 @@ class LiveOrderExecutor(OrderExecutor):
         fill_price = float(market_order.get("average") or market_order.get("price") or entry_price_hint)
 
         sl_order_id: str | None = None
-        tp_order_id: str | None = None
         try:
             sl_order = self._client.create_stop_market_order(
                 symbol, exit_side, amount, stop_loss_price, params={"reduceOnly": True}
             )
             sl_order_id = sl_order.get("id")
-
-            tp_order = self._client.create_take_profit_market_order(
-                symbol, exit_side, amount, take_profit_price, params={"reduceOnly": True}
-            )
-            tp_order_id = tp_order.get("id")
         except Exception as exc:  # noqa: BLE001 - cualquier fallo aquí es crítico
             logger.error(
-                "Fallo colocando órdenes de protección SL/TP tras abrir posición: %s. "
+                "Fallo colocando la orden de protección SL tras abrir posición: %s. "
                 "Cerrando posición inmediatamente para evitar exposición sin protección.",
                 exc,
             )
@@ -76,18 +78,16 @@ class LiveOrderExecutor(OrderExecutor):
             raise ProtectiveOrderFailure(str(exc)) from exc
 
         logger.info(
-            "Posición abierta y protegida: %s %s amount=%.6f entry=%.4f SL=%.4f (id=%s) TP=%.4f (id=%s)",
+            "Posición abierta y protegida: %s %s amount=%.6f entry=%.4f SL=%.4f (id=%s)",
             entry_side.upper(),
             symbol,
             amount,
             fill_price,
             stop_loss_price,
             sl_order_id,
-            take_profit_price,
-            tp_order_id,
         )
 
-        self._managed_protective_orders[symbol] = (sl_order_id, tp_order_id)
+        self._managed_protective_orders[symbol] = (sl_order_id, None)
         opened_at = datetime.now(UTC).isoformat()
         fee_paid = float(market_order.get("fee", {}).get("cost") or 0.0)
         journal_id = self._journal.record_open(
@@ -114,7 +114,7 @@ class LiveOrderExecutor(OrderExecutor):
             stop_loss_price=stop_loss_price,
             take_profit_price=take_profit_price,
             sl_order_id=sl_order_id,
-            tp_order_id=tp_order_id,
+            tp_order_id=None,
         )
 
     def close_position(
@@ -174,18 +174,17 @@ class LiveOrderExecutor(OrderExecutor):
         if journal_row is None:
             return None
 
-        stop_loss_price = float(journal_row["stop_loss_price"])
-        take_profit_price = float(journal_row["take_profit_price"])
         entry_price = float(journal_row["entry_price"])
         amount = float(journal_row["amount"])
         side = str(journal_row["side"])
+        is_long = side == "buy"
 
+        # Sin Take Profit fijo, la única orden de protección es el SL: si la
+        # posición se cerró, fue por ese trigger (o un cierre manual externo,
+        # indistinguible de stop_loss sin más información del exchange).
+        close_reason = "stop_loss"
         ticker = self._client.fetch_ticker(symbol)
         exit_price = float(ticker["last"])
-        midpoint = (stop_loss_price + take_profit_price) / 2
-        is_long = side == "buy"
-        hit_tp = (exit_price >= midpoint) if is_long else (exit_price <= midpoint)
-        close_reason = "take_profit" if hit_tp else "stop_loss"
 
         pnl = (exit_price - entry_price) * amount if is_long else (entry_price - exit_price) * amount
         closed_at = datetime.now(UTC).isoformat()
@@ -207,6 +206,69 @@ class LiveOrderExecutor(OrderExecutor):
         )
 
         return ClosedTrade(symbol=symbol, exit_price=exit_price, pnl=pnl, close_reason=close_reason)
+
+    def update_trailing_stop(
+        self,
+        symbol: str,
+        ohlcv: pd.DataFrame,
+        channel_period: int,
+    ) -> None:
+        """Desplaza el SL server-side según un canal Donchian, sin dejar la
+        posición desprotegida: la nueva orden STOP_MARKET se coloca primero
+        y solo tras confirmarse se cancela la vieja (ver regla 1 de gestión
+        de riesgo: nunca una posición sin protección server-side).
+        """
+        protective_orders = self._managed_protective_orders.get(symbol)
+        if protective_orders is None:
+            return
+        old_sl_order_id, _tp_order_id = protective_orders
+
+        journal_row = self._journal.get_open_entry(symbol, execution_mode="live")
+        if journal_row is None:
+            return
+
+        side = str(journal_row["side"])
+        amount = float(journal_row["amount"])
+        current_sl = float(journal_row["stop_loss_price"])
+        is_long = side == "buy"
+        exit_side = "sell" if is_long else "buy"
+
+        channel = ohlcv.iloc[-(channel_period + 1) : -1]
+        if channel.empty:
+            return
+
+        if is_long:
+            candidate_sl = float(channel["low"].min())
+            new_sl = max(candidate_sl, current_sl)
+        else:
+            candidate_sl = float(channel["high"].max())
+            new_sl = min(candidate_sl, current_sl)
+
+        if new_sl == current_sl:
+            return
+
+        try:
+            new_sl_order = self._client.create_stop_market_order(
+                symbol, exit_side, amount, new_sl, params={"reduceOnly": True}
+            )
+        except Exception as exc:  # noqa: BLE001 - no crítico: el SL vigente sigue protegiendo la posición
+            logger.warning(
+                "No se pudo colocar el nuevo SL del trailing en %s (SL vigente %.4f sigue activo): %s",
+                symbol,
+                current_sl,
+                exc,
+            )
+            return
+
+        new_sl_order_id = new_sl_order.get("id")
+        if old_sl_order_id is not None:
+            self._cancel_orphan_order(old_sl_order_id, symbol)
+
+        self._managed_protective_orders[symbol] = (new_sl_order_id, None)
+        self._journal.update_stop_loss(journal_row["id"], new_sl)
+        logger.info(
+            "[LIVE] TRAILING %s SL %.4f -> %.4f (orden %s)", symbol, current_sl, new_sl, new_sl_order_id
+        )
 
     def _cancel_orphan_order(self, order_id: str, symbol: str) -> None:
         try:

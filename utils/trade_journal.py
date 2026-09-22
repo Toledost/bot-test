@@ -122,6 +122,13 @@ class TradeJournal:
                 (closed_at, exit_price, pnl, extra_fee, close_reason, entry_id),
             )
 
+    def update_stop_loss(self, entry_id: int, new_stop_loss_price: float) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE journal_entries SET stop_loss_price = ? WHERE id = ?",
+                (new_stop_loss_price, entry_id),
+            )
+
     def delete_by_mode(self, execution_mode: str) -> int:
         """Elimina todas las entradas de un execution_mode dado (ej. limpiar backtests previos).
 

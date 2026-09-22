@@ -5,6 +5,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
 
+import pandas as pd
+
 from strategies.base_strategy import Signal
 
 
@@ -33,8 +35,13 @@ class ClosedTrade:
 class OrderExecutor(ABC):
     """Contrato que deben cumplir tanto el ejecutor real como el simulado (paper).
 
-    Ambas implementaciones garantizan que, tras abrir una posición, las
-    órdenes de protección (SL/TP) quedan colocadas antes de retornar.
+    Ambas implementaciones garantizan que, tras abrir una posición, la orden
+    de protección (Stop Loss) queda colocada antes de retornar. No hay Take
+    Profit fijo: la salida es exclusivamente por Stop Loss, que solo se
+    desplaza a favor del trader vía update_trailing_stop (ver su docstring).
+    `take_profit_price` se conserva en la interfaz por compatibilidad de
+    sizing y se persiste a título informativo en el journal, pero ningún
+    executor lo usa como criterio de cierre.
     """
 
     @abstractmethod
@@ -90,12 +97,30 @@ class OrderExecutor(ABC):
         Se llama en cada ciclo antes de buscar nuevas señales. Retorna None si
         sigue abierta o si no hay ninguna posición gestionada por el bot.
         En paper, `current_price_hint` (el último precio de ticker del ciclo) es
-        obligatorio: se usa para simular si el precio cruzó SL/TP. `high_hint`/
-        `low_hint` son opcionales y solo los usa scripts/backtest.py: si se dan,
-        se compara el SL/TP contra el rango completo de la vela (más realista
-        que solo el cierre) en vez de contra `current_price_hint`. `timestamp_hint`:
-        ver docstring de open_position. En live se ignoran todos: se verifica si
-        las órdenes SL/TP siguen abiertas en el exchange.
+        obligatorio: se usa para simular si el precio cruzó el Stop Loss.
+        `high_hint`/`low_hint` son opcionales y solo los usa scripts/backtest.py:
+        si se dan, se compara el SL contra el rango completo de la vela (más
+        realista que solo el cierre) en vez de contra `current_price_hint`.
+        `timestamp_hint`: ver docstring de open_position. En live se ignoran
+        todos: se verifica si la orden SL sigue abierta en el exchange.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def update_trailing_stop(
+        self,
+        symbol: str,
+        ohlcv: pd.DataFrame,
+        channel_period: int,
+    ) -> None:
+        """Actualiza el Stop Loss de la posición gestionada según un canal Donchian.
+
+        En LONG, el SL sube al máximo entre el mínimo de las últimas
+        `channel_period` velas (excluyendo la última, aún en formación/recién
+        cerrada) y el SL actual — nunca retrocede a favor del mercado. En
+        SHORT es simétrico con el máximo de esas velas. No hace nada si no
+        hay posición gestionada en `symbol` o si el canal no mejora el SL
+        vigente. Se llama una vez por ciclo, antes de evaluar nuevas señales.
         """
         raise NotImplementedError
 
